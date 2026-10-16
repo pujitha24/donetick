@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"strconv"
 	"testing"
 	"time"
 
@@ -249,4 +250,53 @@ func TestEditChoreWithoutLabelsV2KeepsLabels(t *testing.T) {
 	recorder = edit(body)
 	require.Equal(t, http.StatusOK, recorder.Code, recorder.Body.String())
 	require.Zero(t, labelCount(), "an empty labelsV2 still removes the labels")
+}
+
+// A chore whose creator is gone (or is someone else) must still be deletable by
+// a circle admin or manager, but not by an ordinary member.
+func TestDeleteChoreByNonCreator(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		role cModel.UserRole
+		want int
+	}{
+		{"admin", cModel.UserRoleAdmin, http.StatusOK},
+		{"manager", cModel.UserRoleManager, http.StatusOK},
+		{"member", cModel.UserRoleMember, http.StatusForbidden},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			gin.SetMode(gin.TestMode)
+			db, err := gorm.Open(sqlite.Open(filepath.Join(t.TempDir(), "delete.db")), &gorm.Config{})
+			require.NoError(t, err)
+			require.NoError(t, database.Migration(db))
+			require.NoError(t, db.Create(&cModel.UserCircle{UserID: 1, CircleID: 1, Role: test.role, IsActive: true}).Error)
+
+			cfg := &config.Config{}
+			cfg.Database.Type = "sqlite"
+			cfg.Storage.BasePath = t.TempDir()
+			h := &Handler{
+				choreRepo:   chRepo.NewChoreRepository(db, cfg),
+				circleRepo:  cRepo.NewCircleRepository(db),
+				tRepo:       tRepo.NewThingRepository(db, cfg),
+				nRepo:       nRepo.NewNotificationRepository(db),
+				storage:     storage.NewLocalStorage(cfg),
+				storageRepo: storageRepo.NewStorageRepository(db, cfg),
+			}
+			router := gin.New()
+			router.Use(func(c *gin.Context) {
+				c.Set("id", &uModel.UserDetails{User: uModel.User{ID: 1, CircleID: 1}})
+				c.Next()
+			})
+			router.DELETE("/chores/:id", h.DeleteChore)
+
+			// CreatedBy 99 refers to a user that no longer exists.
+			chore := chModel.Chore{Name: "orphan", FrequencyType: chModel.FrequencyTypeOnce,
+				AssignStrategy: chModel.AssignmentStrategyRandom, CircleID: 1, CreatedBy: 99, IsActive: true}
+			require.NoError(t, db.Create(&chore).Error)
+
+			recorder := httptest.NewRecorder()
+			router.ServeHTTP(recorder, httptest.NewRequest(http.MethodDelete, "/chores/"+strconv.Itoa(chore.ID), nil))
+			require.Equal(t, test.want, recorder.Code, recorder.Body.String())
+		})
+	}
 }
